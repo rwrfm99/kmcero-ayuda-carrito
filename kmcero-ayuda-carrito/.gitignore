@@ -1,0 +1,28 @@
+# Dependencias
+node_modules/
+
+# Build generado — nunca subir el código ofuscado al repo
+dist/
+
+# Generador de licencias — PRIVADO, nunca subir
+keygen.html
+
+# Logs
+*.log
+npm-debug.log*
+
+# Variables de entorno / secretos
+.env
+.env.*
+*.secret
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
