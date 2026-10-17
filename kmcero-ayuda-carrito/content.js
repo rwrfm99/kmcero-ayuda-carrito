@@ -533,6 +533,16 @@
   let state;
   try { state = JSON.parse(sessionStorage.getItem(KEY) || 'null'); } catch { state = null; }
 
+  // Si la página se recargó mientras estaba en 'verifying', el click ya no
+  // existe — resetear a 'opening' para que el flujo empiece limpio y pueda
+  // detectar correctamente si el producto está agotado o disponible.
+  if (state?.phase === 'verifying') {
+    log('warn', 'Recarga detectada durante verifying — reseteando a opening');
+    state.phase  = 'opening';
+    state.openAt = Date.now();
+    sessionStorage.setItem(KEY, JSON.stringify(state));
+  }
+
   function ensureState() {
     if (!state && isShop()) {
       const q = new URLSearchParams(location.search).get('search');
@@ -820,6 +830,14 @@
 
       const isUnavailable = /\bagotad[oa]s?\b|sin existencias|sin stock|no disponible/.test(text);
       const isDisabled    = !add && addButtons.length > 0;
+
+      // Si el producto está agotado, actuar siempre — incluso si estábamos
+      // en verifying (el click anterior no sirvió, el stock ya no está).
+      if (isUnavailable && state.phase === 'verifying') {
+        log('warn', 'Agotado detectado tras click — cancelando verifying y reabriendo');
+        state.phase = 'opening'; state.openAt = Date.now(); save();
+        return;
+      }
 
       if ((isUnavailable || isDisabled) && state.phase !== 'verifying') {
         const reopenAttempts = (state.reopenAttempts || 0) + 1;
