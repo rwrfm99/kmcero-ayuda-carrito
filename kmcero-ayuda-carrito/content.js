@@ -17,98 +17,364 @@
   };
   const label = el => (el?.getAttribute('aria-label') || el?.innerText || el?.getAttribute('alt') || el?.textContent || '').trim();
 
-  // ─── Backoff exponencial ───────────────────────────────────────────────────
-  // Cada vez que el servidor está saturado o hay que esperar, el intervalo
-  // se duplica hasta un máximo de BACKOFF_MAX_MS. Se resetea al detectar
-  // una respuesta exitosa del servidor.
-  const BACKOFF_BASE_MS  = 10_000;   // 10 s — intervalo inicial
-  const BACKOFF_MAX_MS   = 300_000;  // 5 min — techo del backoff
-  const BACKOFF_FACTOR   = 2;        // duplicar en cada fallo consecutivo
+  const DEFAULT_MAX_REOPEN = 5;
 
-  let backoffLevel = 0; // número de fallos consecutivos acumulados
+  // ─── Logger ────────────────────────────────────────────────────────────────
+  const LOG_STYLES = {
+    info:  'color:#096b59;font-weight:bold',
+    warn:  'color:#b45309;font-weight:bold',
+    error: 'color:#dc2626;font-weight:bold',
+    ok:    'color:#16a34a;font-weight:bold',
+    net:   'color:#7c3aed;font-weight:bold',
+  };
+  let lastLogMsg = '';
+  function log(level, msg, data) {
+    const full = `[KMCERO] ${msg}`;
+    // Solo suprimir mensajes de espera repetitivos (info/warn de bucle),
+    // nunca suprimir ok/error que indican una acción importante.
+    if (full === lastLogMsg && level !== 'ok' && level !== 'error') return;
+    lastLogMsg = full;
+    data !== undefined
+      ? console.log(`%c${full}`, LOG_STYLES[level] || '', data)
+      : console.log(`%c${full}`, LOG_STYLES[level] || '');
+  }
+
+  // ─── Backoff exponencial ───────────────────────────────────────────────────
+  const BACKOFF_BASE_MS = 10_000;
+  const BACKOFF_MAX_MS  = 300_000;
+  const BACKOFF_FACTOR  = 2;
+  let backoffLevel = 0;
 
   function backoffMs() {
     return Math.min(BACKOFF_BASE_MS * Math.pow(BACKOFF_FACTOR, backoffLevel), BACKOFF_MAX_MS);
   }
-  function bumpBackoff() {
-    backoffLevel = Math.min(backoffLevel + 1, 8); // tope en 2^8 × base = ~2560 s > MAX
+  function bumpBackoff(reason) {
+    backoffLevel = Math.min(backoffLevel + 1, 8);
+    log('warn', `Backoff nivel ${backoffLevel} (${Math.round(backoffMs()/1000)}s) — ${reason}`);
   }
-  function resetBackoff() {
+  function resetBackoff(reason) {
+    if (backoffLevel > 0) log('ok', `Backoff reseteado — ${reason}`);
     backoffLevel = 0;
   }
 
-  // ─── Detección de saturación (HTTP + texto) ────────────────────────────────
-  // Además del texto visible, escucha respuestas fetch/XHR para capturar
-  // 429 / 503 / 502 antes de que el DOM refleje el error.
-  const RATE_LIMIT_RE = /demasiadas solicitudes|uso intensivo|cuenta bloqueada|error 429|intentos excesivos/i;
+  // ─── Detección de saturación vía red ──────────────────────────────────────
+  const RATE_LIMIT_RE   = /demasiadas solicitudes|uso intensivo|cuenta bloqueada|error 429|intentos excesivos/i;
   const SERVER_ERROR_RE = /error 503|servicio no disponible|bad gateway|error 502/i;
 
-  let saturationFlag = false;   // 429 / saturación detectada vía red
-  let serverErrorFlag = false;  // 502 / 503 detectada vía red
-  let lastNetworkEvent = 0;     // timestamp del último evento de red problemático
+  let saturationFlag  = false;
+  let serverErrorFlag = false;
+  let lastNetworkEvent = 0;
 
-  // Interceptar fetch para detectar códigos de error HTTP sin recargar la página
   const _origFetch = window.fetch;
   window.fetch = async function (...args) {
+    const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '?';
     try {
       const res = await _origFetch.apply(this, args);
       if (res.status === 429) {
-        saturationFlag = true;
-        lastNetworkEvent = Date.now();
-        bumpBackoff();
+        saturationFlag = true; lastNetworkEvent = Date.now();
+        bumpBackoff(`HTTP 429 en fetch → ${url}`);
       } else if (res.status === 502 || res.status === 503) {
-        serverErrorFlag = true;
-        lastNetworkEvent = Date.now();
-        bumpBackoff();
+        serverErrorFlag = true; lastNetworkEvent = Date.now();
+        bumpBackoff(`HTTP ${res.status} en fetch → ${url}`);
       } else if (res.ok) {
-        // Respuesta exitosa: limpiar flags si han pasado al menos 30 s sin error
         if (Date.now() - lastNetworkEvent > 30_000) {
-          saturationFlag = false;
-          serverErrorFlag = false;
+          if (saturationFlag || serverErrorFlag) log('ok', `Servidor recuperado (${res.status}) → ${url}`);
+          saturationFlag = false; serverErrorFlag = false;
         }
+      } else {
+        log('warn', `fetch no-ok: ${res.status} → ${url}`);
       }
       return res;
     } catch (err) {
-      // Error de red (timeout, sin conexión): tratar como saturación temporal
-      bumpBackoff();
+      log('error', `fetch falló (red) → ${url}`, err.message);
+      bumpBackoff(`error de red en fetch → ${url}`);
       throw err;
     }
   };
 
-  // Interceptar XMLHttpRequest para el mismo propósito
   const _origOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (...args) {
+    const url = args[1] || '?';
     this.addEventListener('load', () => {
       if (this.status === 429) {
-        saturationFlag = true;
-        lastNetworkEvent = Date.now();
-        bumpBackoff();
+        saturationFlag = true; lastNetworkEvent = Date.now();
+        bumpBackoff(`HTTP 429 en XHR → ${url}`);
       } else if (this.status === 502 || this.status === 503) {
-        serverErrorFlag = true;
-        lastNetworkEvent = Date.now();
-        bumpBackoff();
+        serverErrorFlag = true; lastNetworkEvent = Date.now();
+        bumpBackoff(`HTTP ${this.status} en XHR → ${url}`);
       } else if (this.status >= 200 && this.status < 300) {
         if (Date.now() - lastNetworkEvent > 30_000) {
-          saturationFlag = false;
-          serverErrorFlag = false;
+          if (saturationFlag || serverErrorFlag) log('ok', `Servidor recuperado (${this.status}) XHR → ${url}`);
+          saturationFlag = false; serverErrorFlag = false;
         }
+      } else if (this.status !== 0) {
+        log('warn', `XHR no-ok: ${this.status} → ${url}`);
       }
     });
-    this.addEventListener('error', () => { bumpBackoff(); });
+    this.addEventListener('error', () => {
+      log('error', `XHR falló (red) → ${url}`);
+      bumpBackoff(`error de red en XHR → ${url}`);
+    });
     return _origOpen.apply(this, args);
   };
 
   let blockedCache = { at: 0, value: false };
   function blocked() {
     const now = Date.now();
-    // Respetar el flag de red aunque el DOM no lo muestre aún
     if (saturationFlag) return true;
     if (now - blockedCache.at < 1500) return blockedCache.value;
-    blockedCache = { at: now, value: RATE_LIMIT_RE.test(document.body.innerText) };
-    return blockedCache.value;
+    const domBlocked = RATE_LIMIT_RE.test(document.body.innerText);
+    if (domBlocked && !blockedCache.value) log('error', 'Bloqueo detectado en el DOM (429)');
+    blockedCache = { at: now, value: domBlocked };
+    return domBlocked;
   }
   function serverBusy() {
     return serverErrorFlag || SERVER_ERROR_RE.test(document.body.innerText);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // OPTIMIZACIONES DE CONEXIÓN — cada una se activa/desactiva desde el panel
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── 1. Bloqueo de imágenes ────────────────────────────────────────────────
+  const IMG_BLOCK_ATTR = 'data-kmcero-src';
+  const BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+  let imgBlockActive = false;
+  let imgObserver = null;
+
+  function blockImage(img) {
+    if (!img.complete && img.src && img.src !== BLANK_GIF && !img.hasAttribute(IMG_BLOCK_ATTR)) {
+      img.setAttribute(IMG_BLOCK_ATTR, img.src);
+      img.src = BLANK_GIF;
+    }
+  }
+  function startImageBlocking() {
+    if (imgBlockActive) return;
+    imgBlockActive = true;
+    document.querySelectorAll('img').forEach(blockImage);
+    imgObserver = new MutationObserver(mutations => {
+      if (!imgBlockActive) return;
+      for (const m of mutations)
+        for (const node of m.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          if (node.tagName === 'IMG') blockImage(node);
+          node.querySelectorAll?.('img').forEach(blockImage);
+        }
+    });
+    imgObserver.observe(document.documentElement, { childList: true, subtree: true });
+    log('info', 'Bloqueo de imágenes activado');
+  }
+  function stopImageBlocking() {
+    if (!imgBlockActive) return;
+    imgBlockActive = false;
+    imgObserver?.disconnect(); imgObserver = null;
+    let n = 0;
+    document.querySelectorAll(`img[${IMG_BLOCK_ATTR}]`).forEach(img => {
+      img.src = img.getAttribute(IMG_BLOCK_ATTR);
+      img.removeAttribute(IMG_BLOCK_ATTR); n++;
+    });
+    if (n > 0) log('info', `Bloqueo de imágenes desactivado — ${n} restauradas`);
+  }
+
+  // ─── 2. Bloqueo de fuentes web ─────────────────────────────────────────────
+  // Elimina los <link rel="stylesheet"> que apuntan a Google Fonts u otras CDN
+  // de fuentes. Las fuentes del sistema se mantienen; la página sigue legible.
+  const FONT_HOST_RE = /fonts\.(googleapis|gstatic)\.com|typekit\.net|use\.fontawesome|cdn\.jsdelivr\.net.*font/i;
+  let fontBlockActive = false;
+  let fontObserver = null;
+  const blockedFontEls = [];
+
+  function blockFontEl(el) {
+    const href = el.href || el.src || '';
+    if (FONT_HOST_RE.test(href) && !el.dataset.kmceroFont) {
+      el.dataset.kmceroFont = href;
+      el.disabled = true;      // <link> se puede deshabilitar sin removerlo
+      blockedFontEls.push(el);
+    }
+  }
+  function startFontBlocking() {
+    if (fontBlockActive) return;
+    fontBlockActive = true;
+    document.querySelectorAll('link[rel="stylesheet"],link[rel="preload"],style').forEach(blockFontEl);
+    fontObserver = new MutationObserver(mutations => {
+      if (!fontBlockActive) return;
+      for (const m of mutations)
+        for (const node of m.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          if (node.matches?.('link,style')) blockFontEl(node);
+          node.querySelectorAll?.('link,style').forEach(blockFontEl);
+        }
+    });
+    fontObserver.observe(document.documentElement, { childList: true, subtree: true });
+    log('info', `Bloqueo de fuentes web activado (${blockedFontEls.length} bloqueadas)`);
+  }
+  function stopFontBlocking() {
+    if (!fontBlockActive) return;
+    fontBlockActive = false;
+    fontObserver?.disconnect(); fontObserver = null;
+    blockedFontEls.forEach(el => { el.disabled = false; delete el.dataset.kmceroFont; });
+    blockedFontEls.length = 0;
+    log('info', 'Bloqueo de fuentes desactivado');
+  }
+
+  // ─── 3. Bloqueo de analítica y tracking ───────────────────────────────────
+  // Cancela peticiones fetch/XHR a dominios de analítica conocidos.
+  // No afecta a las peticiones propias de kmcero.cu.
+  const ANALYTICS_RE = /google-analytics\.com|googletagmanager\.com|analytics\.google\.com|hotjar\.com|segment\.(io|com)|mixpanel\.com|amplitude\.com|clarity\.ms|facebook\.net|connect\.facebook|doubleclick\.net|_vercel\/insights|plausible\.io|matomo\.|piwik\./i;
+  let analyticsBlockActive = false;
+
+  // Guardamos los originales UNA sola vez para no anidar wrappers
+  const _fetchForAnalytics = _origFetch; // ya tenemos el original guardado arriba
+
+  function startAnalyticsBlocking() {
+    if (analyticsBlockActive) return;
+    analyticsBlockActive = true;
+    log('info', 'Bloqueo de analítica activado');
+  }
+  function stopAnalyticsBlocking() {
+    if (!analyticsBlockActive) return;
+    analyticsBlockActive = false;
+    log('info', 'Bloqueo de analítica desactivado');
+  }
+  // El filtro se aplica dentro del wrapper de fetch ya instalado:
+  // lo chequeamos en la función shouldBlockRequest()
+  function shouldBlockAnalytics(url) {
+    return analyticsBlockActive && ANALYTICS_RE.test(url);
+  }
+
+  // Parchamos el fetch una sola vez (ya está parcheado arriba); añadimos
+  // el chequeo de analítica dentro del flujo existente mediante una variable.
+  // Para XHR hacemos lo mismo: detectamos en el send.
+  const _origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function (...args) {
+    if (this._kmceroUrl && shouldBlockAnalytics(this._kmceroUrl)) {
+      log('net', `XHR analítica bloqueado → ${this._kmceroUrl}`);
+      return; // no enviar
+    }
+    return _origSend.apply(this, args);
+  };
+  // Guardamos la URL en open para poder leerla en send
+  const _origOpenWrapped = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (...args) {
+    this._kmceroUrl = args[1] || '';
+    return _origOpenWrapped.apply(this, args);
+  };
+
+  // ─── 4. Adaptación automática a conexión lenta ────────────────────────────
+  // Usa navigator.connection para ajustar el retrySeconds automáticamente
+  // cuando la red es lenta, y pausa la extensión si no hay conexión.
+  let connAdaptActive = false;
+  let connAdaptMultiplier = 1; // factor actual aplicado al retrySeconds
+
+  const CONN_SLOW_TYPES = new Set(['slow-2g', '2g', '3g']);
+
+  function getConnectionQuality() {
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (!conn) return 'unknown';
+    if (!navigator.onLine) return 'offline';
+    if (CONN_SLOW_TYPES.has(conn.effectiveType)) return 'slow';
+    if (conn.effectiveType === '4g' && conn.rtt > 500) return 'slow'; // 4G con latencia alta
+    return 'good';
+  }
+
+  function applyConnAdapt() {
+    if (!connAdaptActive) { connAdaptMultiplier = 1; return; }
+    const quality = getConnectionQuality();
+    const prev = connAdaptMultiplier;
+    if (quality === 'offline') {
+      connAdaptMultiplier = 0; // señal para pausar
+      if (prev !== 0) log('warn', 'Sin conexión — extensión en pausa hasta recuperar red');
+    } else if (quality === 'slow') {
+      connAdaptMultiplier = 2;
+      if (prev !== 2) log('warn', `Conexión lenta (${navigator.connection?.effectiveType}) — intervalos duplicados`);
+    } else {
+      connAdaptMultiplier = 1;
+      if (prev > 1) log('ok', 'Conexión recuperada — intervalos normales');
+    }
+  }
+
+  function effectiveRetryMs(base) {
+    // base en segundos → ms con el multiplicador aplicado
+    return base * 1000 * Math.max(1, connAdaptMultiplier);
+  }
+
+  // Escuchar cambios de conexión
+  window.addEventListener('online',  () => { applyConnAdapt(); });
+  window.addEventListener('offline', () => { applyConnAdapt(); });
+  navigator.connection?.addEventListener?.('change', () => { applyConnAdapt(); });
+
+  function startConnAdapt() {
+    connAdaptActive = true;
+    applyConnAdapt();
+    log('info', `Adaptación de conexión activada (calidad actual: ${getConnectionQuality()})`);
+  }
+  function stopConnAdapt() {
+    connAdaptActive = false;
+    connAdaptMultiplier = 1;
+    log('info', 'Adaptación de conexión desactivada');
+  }
+
+  // ─── Sincronizar todas las optimizaciones con el estado ───────────────────
+  function syncOptimizations() {
+    const s = state;
+    const on = s?.active ?? false;
+
+    // Imágenes
+    (on && (s?.blockImages ?? true)) ? startImageBlocking() : stopImageBlocking();
+    // Fuentes
+    (on && (s?.blockFonts ?? false)) ? startFontBlocking() : stopFontBlocking();
+    // Analítica
+    (on && (s?.blockAnalytics ?? true)) ? startAnalyticsBlocking() : stopAnalyticsBlocking();
+    // Conexión
+    (on && (s?.adaptConn ?? true)) ? startConnAdapt() : stopConnAdapt();
+  }
+
+  // ─── Estabilidad del modal ─────────────────────────────────────────────────
+  const MODAL_IDLE_MS    = 1200;
+  const MODAL_TIMEOUT_MS = 8000;
+  let modalObserver   = null;
+  let modalStableAt   = 0;
+  let modalObservedEl = null;
+
+  function observeModal(box) {
+    if (modalObservedEl === box) return;
+    stopModalObserver();
+    modalObservedEl = box;
+    modalStableAt   = 0;
+    let idleTimer = null;
+    const markStable = () => { modalStableAt = Date.now(); };
+    const reset = () => { modalStableAt = 0; clearTimeout(idleTimer); idleTimer = setTimeout(markStable, MODAL_IDLE_MS); };
+    modalObserver = new MutationObserver(reset);
+    modalObserver.observe(box, { childList: true, subtree: true, characterData: true, attributes: true });
+    idleTimer = setTimeout(markStable, MODAL_IDLE_MS);
+    log('info', 'Observando modal — esperando que cargue la disponibilidad…');
+  }
+  function stopModalObserver() {
+    modalObserver?.disconnect(); modalObserver = null;
+    modalObservedEl = null; modalStableAt = 0;
+  }
+  function modalReady(box, openAt) {
+    observeModal(box);
+    if (modalStableAt > 0) return true;
+    if (Date.now() - openAt > MODAL_TIMEOUT_MS) {
+      log('warn', `Modal tardó más de ${MODAL_TIMEOUT_MS/1000}s — actuando igual`);
+      return true;
+    }
+    return false;
+  }
+
+  // ─── Cerrar modal ──────────────────────────────────────────────────────────
+  function closeModal(box) {
+    stopModalObserver();
+    const closeBtn = [...box.querySelectorAll('button,[role="button"]')]
+      .find(el => visible(el) && /^(×|✕|✖|cerrar|close|cancelar)$/i.test(label(el).trim()));
+    if (closeBtn) { closeBtn.click(); return; }
+    const ariaClose = box.querySelector('[aria-label*="cerrar" i],[aria-label*="close" i]');
+    if (ariaClose && visible(ariaClose)) { ariaClose.click(); return; }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    document.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Escape', bubbles: true, cancelable: true }));
+    const backdrop = document.querySelector('[class*="overlay" i],[class*="backdrop" i],[class*="mask" i]');
+    if (backdrop && visible(backdrop)) backdrop.click();
   }
 
   // ─── Panel UI ──────────────────────────────────────────────────────────────
@@ -119,25 +385,57 @@
     <style>
       :host { all: initial; } * { box-sizing: border-box; }
       #toggle { position: fixed; left: 18px; bottom: 18px; z-index: 2147483646; border: 0; border-radius: 999px; padding: 13px 18px; background: #096b59; color: white; font: 700 14px system-ui; box-shadow: 0 5px 20px #0004; cursor: pointer; }
-      #panel { position: fixed; left: 18px; bottom: 72px; z-index: 2147483646; width: min(370px, calc(100vw - 36px)); background: white; color: #152621; border: 1px solid #d2e2dc; border-radius: 16px; box-shadow: 0 12px 38px #0004; font: 14px system-ui; overflow: hidden; display: none; }
-      #panel.open { display: block; } header { padding: 16px; background: #ecf7f3; } h2 { margin: 0 0 6px; font-size: 18px; } p { margin: 0; color: #52635d; font-size: 12px; line-height: 1.45; }
-      main { padding: 15px 16px; } strong { display: block; margin-bottom: 9px; }
+      #panel { position: fixed; left: 18px; bottom: 72px; z-index: 2147483646; width: min(390px, calc(100vw - 36px)); background: white; color: #152621; border: 1px solid #d2e2dc; border-radius: 16px; box-shadow: 0 12px 38px #0004; font: 14px system-ui; overflow: hidden; display: none; }
+      #panel.open { display: block; }
+      header { padding: 16px; background: #ecf7f3; }
+      h2 { margin: 0 0 6px; font-size: 18px; }
+      header p { margin: 0; color: #52635d; font-size: 12px; line-height: 1.45; }
+      main { padding: 15px 16px; }
+      section.group { border: 1px solid #d2e2dc; border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+      section.group summary-title { display: block; font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #52635d; margin-bottom: 8px; }
+      strong.block { display: block; margin-bottom: 9px; }
       input[type=text] { width: 100%; padding: 8px 9px; margin-bottom: 4px; border: 1px solid #adcbc0; border-radius: 7px; font: 13px system-ui; }
-      label { display: flex; align-items: center; gap: 8px; margin: 12px 0; font-size: 13px; } select, input[type=number] { padding: 6px; border: 1px solid #adcbc0; border-radius: 7px; } input[type=number] { width: 64px; }
-      button.action { border: 0; border-radius: 8px; padding: 9px 12px; background: #096b59; color: white; font: 700 13px system-ui; cursor: pointer; margin: 4px 6px 0 0; } #stop { background: #67746f; } #status { margin-top: 13px; min-height: 35px; }
-      #backoff-info { margin-top: 6px; font-size: 11px; color: #888; min-height: 16px; }
+      label.row { display: flex; align-items: center; gap: 8px; margin: 7px 0; font-size: 13px; }
+      label.row small { color: #7a948c; font-size: 11px; margin-left: auto; }
+      select, input[type=number] { padding: 6px; border: 1px solid #adcbc0; border-radius: 7px; }
+      input[type=number] { width: 64px; }
+      input[type=checkbox] { width: 16px; height: 16px; accent-color: #096b59; flex-shrink: 0; }
+      button.action { border: 0; border-radius: 8px; padding: 9px 12px; background: #096b59; color: white; font: 700 13px system-ui; cursor: pointer; margin: 4px 6px 0 0; }
+      #stop { background: #67746f; }
+      #status { margin-top: 13px; min-height: 35px; font-size: 13px; }
+      #conn-info { margin-top: 4px; font-size: 11px; color: #096b59; min-height: 14px; }
+      #backoff-info { margin-top: 3px; font-size: 11px; color: #888; min-height: 14px; }
     </style>
     <button id="toggle" type="button">🛒 Ayuda carrito</button>
     <section id="panel" aria-label="Ayuda para comprar">
-      <header><h2>Ayuda para el carrito</h2><p>Busca el producto por su nombre exacto y vigila su ficha en la tienda KMCERO.</p></header>
-      <main><strong>Producto</strong>
+      <header>
+        <h2>Ayuda para el carrito</h2>
+        <p>Busca el producto por su nombre exacto y vigila su ficha en la tienda KMCERO.</p>
+      </header>
+      <main>
+        <strong class="block">Producto</strong>
         <input id="product" type="text" placeholder="Nombre exacto del producto">
-        <label>Reabrir si está agotado o el botón está desactivado, cada <input id="retry" type="number" min="1" step="1" value="10"> segundos</label>
-        <label>Recargar página completa cada <input id="reload" type="number" min="0" step="1" value="0"> minutos (0 = nunca)</label>
+
+        <section class="group">
+          <summary-title>⏱ Reintentos</summary-title>
+          <label class="row">Reabrir ficha cada <input id="retry" type="number" min="1" step="1" value="10"> s</label>
+          <label class="row">Máx. reaperturas antes de recargar <input id="maxreopen" type="number" min="1" step="1" value="5"></label>
+          <label class="row">Recargar página cada <input id="reload" type="number" min="0" step="1" value="0"> min <small>0 = nunca</small></label>
+        </section>
+
+        <section class="group">
+          <summary-title>⚡ Optimización de conexión</summary-title>
+          <label class="row"><input id="blockimgs"     type="checkbox" checked> No cargar imágenes <small>ahorra banda</small></label>
+          <label class="row"><input id="blockfonts"    type="checkbox">         No cargar fuentes web <small>Google Fonts…</small></label>
+          <label class="row"><input id="blockanalytics" type="checkbox" checked> Bloquear analítica <small>GA, Hotjar…</small></label>
+          <label class="row"><input id="adaptconn"     type="checkbox" checked> Adaptar a conexión lenta <small>auto</small></label>
+        </section>
+
         <button id="start" class="action" type="button">Activar</button>
-        <button id="stop" class="action" type="button">Detener</button>
-        <button id="shop" class="action" type="button">Abrir tienda</button>
-        <p id="status" role="status"></p>
+        <button id="stop"  class="action" type="button">Detener</button>
+        <button id="shop"  class="action" type="button">Abrir tienda</button>
+        <p id="status"      role="status"></p>
+        <p id="conn-info"   aria-live="polite"></p>
         <p id="backoff-info" aria-live="polite"></p>
       </main>
     </section>`;
@@ -151,45 +449,68 @@
   function ensureState() {
     if (!state && isShop()) {
       const q = new URLSearchParams(location.search).get('search');
-      if (q) { state = { active: true, phase: 'looking', productName: q, retrySeconds: 10, reloadMinutes: 0, lastReload: Date.now() }; save(); }
+      if (q) {
+        state = { active: true, phase: 'looking', productName: q, retrySeconds: 10,
+                  reloadMinutes: 0, lastReload: Date.now(), reopenAttempts: 0,
+                  blockImages: true, blockFonts: false, blockAnalytics: true, adaptConn: true };
+        log('info', `Estado restaurado desde URL: buscando "${q}"`);
+        save();
+      }
     }
   }
+
   function save() {
     if (state) sessionStorage.setItem(KEY, JSON.stringify(state));
+    syncOptimizations();
     renderStatus();
   }
 
   function renderStatus() {
     const s = state;
-    if (s?.productName) $('product').value = s.productName;
-    $('retry').value = String(s?.retrySeconds || 10);
-    $('reload').value = String(s?.reloadMinutes ?? 0);
+    if (s?.productName)    $('product').value     = s.productName;
+    $('retry').value        = String(s?.retrySeconds || 10);
+    $('maxreopen').value    = String(s?.maxReopen ?? DEFAULT_MAX_REOPEN);
+    $('reload').value       = String(s?.reloadMinutes ?? 0);
+    $('blockimgs').checked      = s?.blockImages     ?? true;
+    $('blockfonts').checked     = s?.blockFonts      ?? false;
+    $('blockanalytics').checked = s?.blockAnalytics  ?? true;
+    $('adaptconn').checked      = s?.adaptConn       ?? true;
+
     const name = s?.productName || $('product').value;
     $('shop').style.display = name && onProductPage(name) ? 'none' : 'inline-block';
+
+    const reopens = s?.reopenAttempts || 0;
     $('status').textContent = !s ? 'Escribe el producto y pulsa Activar.' :
       !s.active ? (
-        s.phase === 'done'        ? 'KMCERO confirmó el producto en el carrito.' :
-        s.phase === 'rateLimited' ? 'KMCERO mostró un aviso de uso intensivo. Se detuvo.' :
-        s.phase === 'unconfirmed' ? 'Se pulsó Añadir, pero falta confirmación del carrito.' :
+        s.phase === 'done'        ? '✅ KMCERO confirmó el producto en el carrito.' :
+        s.phase === 'rateLimited' ? '🛑 KMCERO mostró un aviso de uso intensivo. Se detuvo.' :
+        s.phase === 'unconfirmed' ? '⚠️ Se pulsó Añadir, pero falta confirmación del carrito.' :
         'Detenido.'
       ) :
-      s.phase === 'waiting'   ? `Se reintentará en ${Math.max(0, Math.ceil((s.retryAt - Date.now()) / 1000))} s.` :
-      s.phase === 'opening'   ? 'Abriendo la ficha del producto…' :
-      s.phase === 'verifying' ? 'Se pulsó Añadir. Esperando confirmación de KMCERO…' :
-      'Vigilando el producto en la tienda…';
+      s.phase === 'reopening' ? `🔄 Reabriendo ficha en ${Math.max(0, Math.ceil((s.retryAt - Date.now()) / 1000))} s (intento ${reopens}/${s.maxReopen ?? DEFAULT_MAX_REOPEN})…` :
+      s.phase === 'waiting'   ? `⏳ Esperando ${Math.max(0, Math.ceil((s.retryAt - Date.now()) / 1000))} s para recargar…` :
+      s.phase === 'opening'   ? '🔍 Abriendo la ficha del producto…' :
+      s.phase === 'verifying' ? '🛒 Pulsado Añadir — esperando confirmación…' :
+      '👀 Vigilando el producto en la tienda…';
 
-    // Mostrar nivel de backoff si hay presión en el servidor
+    // Indicador de calidad de conexión
+    const ci = $('conn-info');
+    if (s?.active && s?.adaptConn) {
+      const q = getConnectionQuality();
+      ci.textContent = q === 'offline' ? '📵 Sin conexión — en pausa'
+        : q === 'slow' ? `🐢 Conexión lenta (${navigator.connection?.effectiveType || '?'}) — intervalos ×2`
+        : `🟢 Conexión (${navigator.connection?.effectiveType || 'ok'})`;
+    } else { ci.textContent = ''; }
+
     const bi = $('backoff-info');
-    if (backoffLevel > 0 && s?.active) {
-      const nextMs = backoffMs();
-      const nextSec = Math.round(nextMs / 1000);
-      bi.textContent = `Servidor con carga — próximo intento en hasta ${nextSec} s (nivel ${backoffLevel})`;
-    } else {
-      bi.textContent = '';
-    }
+    bi.textContent = (backoffLevel > 0 && s?.active)
+      ? `⚠️ Servidor con carga — próximo intento en hasta ${Math.round(backoffMs()/1000)} s (nivel ${backoffLevel})`
+      : '';
   }
+
   ensureState();
   renderStatus();
+  log('info', 'Extensión iniciada', { version: '2.4.0' });
 
   // ─── Helpers DOM ──────────────────────────────────────────────────────────
   function visibleHeadings() {
@@ -242,16 +563,13 @@
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const now = ctx.currentTime;
       [[880, 0], [1175, 0.12]].forEach(([freq, delay]) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'sine';
-        osc.frequency.value = freq;
+        const osc = ctx.createOscillator(), gain = ctx.createGain();
+        osc.type = 'sine'; osc.frequency.value = freq;
         gain.gain.setValueAtTime(0.0001, now + delay);
         gain.gain.exponentialRampToValueAtTime(0.25, now + delay + 0.02);
         gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.25);
         osc.connect(gain).connect(ctx.destination);
-        osc.start(now + delay);
-        osc.stop(now + delay + 0.26);
+        osc.start(now + delay); osc.stop(now + delay + 0.26);
       });
       setTimeout(() => ctx.close(), 600);
     } catch {}
@@ -262,138 +580,211 @@
     if (document.readyState !== 'complete') return;
     ensureState();
     if (!state?.active) return;
+
+    // Pausar si no hay conexión (adaptación automática)
+    if (connAdaptMultiplier === 0) return;
+
     const name = state.productName;
     if (!onProductPage(name)) return;
 
-    // Si el servidor está saturado (429) → bump backoff y esperar
     if (blocked()) {
+      log('error', 'Deteniendo: bloqueo por uso intensivo detectado');
       state.active = false; state.phase = 'rateLimited'; save(); return;
     }
-
-    // Si el servidor tiene error temporal (502/503) → esperar con backoff, sin detener
     if (serverBusy()) {
       if (state.phase !== 'waiting') {
-        bumpBackoff();
+        bumpBackoff('servidor con error 502/503');
         state.phase = 'waiting';
         state.retryAt = Date.now() + backoffMs();
+        log('warn', `Servidor ocupado — esperando ${Math.round(backoffMs()/1000)}s`);
         save();
       }
       return;
     }
 
-    const target = norm(name);
+    const target   = norm(name);
     const headings = visibleHeadings();
-    const box = modal(target, headings);
+    const box      = modal(target, headings);
+
+    // ── Fase: esperando para reabrir modal ────────────────────────────────
+    if (state.phase === 'reopening') {
+      if (Date.now() < state.retryAt) return;
+      if (box) {
+        log('warn', 'Modal todavía visible — reintentando cierre…');
+        closeModal(box);
+        state.retryAt = Date.now() + 1500; save(); return;
+      }
+      log('info', `Modal cerrado — reabriendo ficha (intento ${state.reopenAttempts})`);
+      state.phase = 'opening'; state.openAt = Date.now(); state.openAttempts = 1; save();
+      const card = clickableCard(target, visibleHeadings());
+      if (card) { card.click(); return; }
+      state.phase = 'looking'; save(); return;
+    }
 
     if (box) {
       const text = norm(box.innerText);
+      log('info', `Ficha abierta — phase: ${state.phase}`);
+
+      // ── Buscar el botón PRIMERO, antes de cualquier otra comprobación ───
+      // Si el botón ya está activo, actuar de inmediato sin esperar que el
+      // modal se "estabilice" — el botón disponible ES la señal de que cargó.
+      if (state.phase !== 'verifying' && state.phase !== 'waiting') {
+        const addButtonsEarly = [...box.querySelectorAll('button,[role="button"]')]
+          .filter(el => visible(el) && /agregar al carrito|a[ñn]adir al carrito/i.test(label(el)));
+        const addEarly = addButtonsEarly.find(el => !el.disabled);
+        if (addEarly) {
+          log('ok', 'Botón "Añadir al carrito" activo — haciendo click inmediato');
+          resetBackoff('botón disponible');
+          state.phase = 'verifying'; state.addAt = Date.now(); save(); addEarly.click(); return;
+        }
+      }
+
+      // ── Esperar a que el modal cargue antes de leer estado ──────────────
+      if (!modalReady(box, state.openAt || Date.now())) {
+        log('info', 'Esperando que el modal termine de cargar…');
+        return;
+      }
 
       if (/en el carrito|este producto ya esta en el carrito/.test(text)) {
-        resetBackoff();
+        log('ok', `¡Producto añadido al carrito! "${name}"`);
+        resetBackoff('producto añadido');
         if (state.phase !== 'done') playAddedSound();
         state.active = false; state.phase = 'done'; save(); return;
       }
 
       if (state.phase === 'waiting') {
         if (Date.now() < state.retryAt) return;
-        // Antes de recargar, verificar que no haya presión de red acumulada
-        const delay = backoffMs();
-        if (delay > state.retrySeconds * 1000) {
-          // El backoff supera el intervalo base: esperar el backoff completo
-          state.retryAt = Date.now() + delay;
-          save();
-          return;
+        if (serverBusy() || saturationFlag) {
+          const delay = backoffMs();
+          log('warn', `Backoff activo — servidor saturado, posponiendo ${Math.round(delay/1000)}s`);
+          state.retryAt = Date.now() + delay; save(); return;
         }
-        location.reload();
-        return;
+        log('info', 'Recargando página para refrescar stock…');
+        location.reload(); return;
       }
 
-      if (/\bagotad[oa]s?\b|sin existencias|sin stock|no disponible/.test(text)) {
-        bumpBackoff();
-        const delay = Math.max(state.retrySeconds * 1000, backoffMs());
-        state.phase = 'waiting'; state.retryAt = Date.now() + delay; save();
-        return;
-      }
-
-      const addButtons = [...box.querySelectorAll('button,[role="button"]')].filter(el => visible(el) && /agregar al carrito|a[ñn]adir al carrito/i.test(label(el)));
+      const addButtons = [...box.querySelectorAll('button,[role="button"]')]
+        .filter(el => visible(el) && /agregar al carrito|a[ñn]adir al carrito/i.test(label(el)));
       const add = addButtons.find(el => !el.disabled);
 
-      if (add && state.phase !== 'verifying') {
-        resetBackoff(); // hay botón activo → servidor respondió bien
-        state.phase = 'verifying'; state.addAt = Date.now(); save(); add.click(); return;
-      }
+      // El botón activo ya se procesó arriba (click inmediato).
+      // Aquí solo manejamos el caso de verifying y botón desactivado.
       if (state.phase === 'verifying' && Date.now() - state.addAt > 8000) {
+        log('warn', 'Timeout confirmación del carrito (8s)');
         state.active = false; state.phase = 'unconfirmed'; save(); return;
       }
-      if (!add && addButtons.length && state.phase !== 'verifying') {
-        bumpBackoff();
-        const delay = Math.max(state.retrySeconds * 1000, backoffMs());
-        state.phase = 'waiting'; state.retryAt = Date.now() + delay; save();
-        return;
+
+      const isUnavailable = /\bagotad[oa]s?\b|sin existencias|sin stock|no disponible/.test(text);
+      const isDisabled    = !add && addButtons.length > 0;
+
+      if ((isUnavailable || isDisabled) && state.phase !== 'verifying') {
+        const reopenAttempts = (state.reopenAttempts || 0) + 1;
+        const reason    = isUnavailable ? 'agotado' : 'botón desactivado';
+        const maxReopen = state.maxReopen ?? DEFAULT_MAX_REOPEN;
+
+        if (reopenAttempts > maxReopen) {
+          log('warn', `${maxReopen} reaperturas sin cambio (${reason}) — recargando página`);
+          state.reopenAttempts = 0;
+          state.phase   = 'waiting';
+          state.retryAt = Date.now() + effectiveRetryMs(state.retrySeconds);
+          save(); return;
+        }
+
+        log('warn', `${reason} — cerrando modal para reabrirlo (intento ${reopenAttempts}/${maxReopen})`);
+        closeModal(box);
+        state.reopenAttempts = reopenAttempts;
+        state.phase   = 'reopening';
+        state.retryAt = Date.now() + effectiveRetryMs(state.retrySeconds);
+        save(); return;
       }
       return;
     }
 
+    // ── Sin ficha abierta ──────────────────────────────────────────────────
     if (state.phase === 'waiting' && Date.now() < state.retryAt) return;
     if (state.phase === 'opening' && Date.now() - state.openAt < 5000) return;
     if (state.phase === 'opening' && state.openAttempts >= 2) {
-      bumpBackoff();
-      const delay = Math.max(state.retrySeconds * 1000, backoffMs());
+      bumpBackoff('no se pudo abrir la ficha tras 2 intentos');
+      const delay = Math.max(effectiveRetryMs(state.retrySeconds), backoffMs());
+      log('warn', `Ficha no abre — esperando ${Math.round(delay/1000)}s`);
       state.phase = 'waiting'; state.retryAt = Date.now() + delay; save(); return;
     }
 
     const card = clickableCard(target, headings);
-    if (!card) { state.phase = 'looking'; save(); return; }
+    if (!card) {
+      if (state.phase !== 'looking') log('info', 'Tarjeta del producto no visible — buscando…');
+      state.phase = 'looking'; save(); return;
+    }
 
-    resetBackoff(); // encontró la tarjeta del producto → servidor ok
-    state.openAttempts = state.phase === 'opening' ? state.openAttempts + 1 : 1;
+    log('info', `Tarjeta encontrada — abriendo ficha (intento ${state.phase === 'opening' ? state.openAttempts + 1 : 1})`);
+    resetBackoff('tarjeta encontrada');
+    state.reopenAttempts = 0;
+    state.openAttempts   = state.phase === 'opening' ? state.openAttempts + 1 : 1;
     state.phase = 'opening'; state.openAt = Date.now(); save(); card.click();
   }
 
   let timer;
   function schedule() {
     if (timer) return;
-    // Cuando hay backoff activo, el tick mínimo respeta el nivel acumulado
-    // para no generar polling inútil cuando el servidor está saturado.
     const tickMs = backoffLevel > 0 ? Math.min(backoffMs() / 4, 5000) : 60;
     timer = setTimeout(() => { timer = null; step(); }, tickMs);
   }
 
   // ─── Eventos UI ────────────────────────────────────────────────────────────
   $('toggle').addEventListener('click', () => { $('panel').classList.toggle('open'); renderStatus(); });
+
   $('start').addEventListener('click', () => {
-    const name = $('product').value.trim() || DEFAULT_PRODUCT;
-    const retrySeconds = Math.max(1, Number($('retry').value) || 10);
-    const reloadMinutes = Math.max(0, Number($('reload').value) || 0);
-    backoffLevel = 0; // reset al activar manualmente
-    saturationFlag = false;
-    serverErrorFlag = false;
-    state = { active: true, phase: 'looking', productName: name, retrySeconds, reloadMinutes, lastReload: Date.now() };
+    const name           = $('product').value.trim() || DEFAULT_PRODUCT;
+    const retrySeconds   = Math.max(1, Number($('retry').value)     || 10);
+    const maxReopen      = Math.max(1, Number($('maxreopen').value)  || DEFAULT_MAX_REOPEN);
+    const reloadMinutes  = Math.max(0, Number($('reload').value)     || 0);
+    const blockImages    = $('blockimgs').checked;
+    const blockFonts     = $('blockfonts').checked;
+    const blockAnalytics = $('blockanalytics').checked;
+    const adaptConn      = $('adaptconn').checked;
+    backoffLevel = 0; saturationFlag = false; serverErrorFlag = false;
+    state = { active: true, phase: 'looking', productName: name,
+              retrySeconds, maxReopen, reloadMinutes, lastReload: Date.now(), reopenAttempts: 0,
+              blockImages, blockFonts, blockAnalytics, adaptConn };
+    log('info', `Activado`, { name, retrySeconds, maxReopen, reloadMinutes, blockImages, blockFonts, blockAnalytics, adaptConn });
     save();
     if (!onProductPage(name)) location.assign(productPageUrl(name)); else schedule();
   });
-  $('stop').addEventListener('click', () => { state = { ...(state || {}), active: false, phase: 'stopped' }; save(); });
-  $('shop').addEventListener('click', () => { location.assign(productPageUrl($('product').value.trim() || state?.productName || DEFAULT_PRODUCT)); });
-  $('retry').addEventListener('change', () => { if (state) { state.retrySeconds = Math.max(1, Number($('retry').value) || 10); save(); } });
-  $('reload').addEventListener('change', () => { if (state) { state.reloadMinutes = Math.max(0, Number($('reload').value) || 0); save(); } });
+
+  $('stop').addEventListener('click', () => {
+    log('info', 'Detenido por el usuario');
+    state = { ...(state || {}), active: false, phase: 'stopped' }; save();
+  });
+  $('shop').addEventListener('click', () => {
+    location.assign(productPageUrl($('product').value.trim() || state?.productName || DEFAULT_PRODUCT));
+  });
+
+  // Cambios en caliente — se aplican sin pulsar Activar de nuevo
+  $('retry').addEventListener('change',        () => { if (state) { state.retrySeconds   = Math.max(1, Number($('retry').value)     || 10);                  save(); } });
+  $('maxreopen').addEventListener('change',    () => { if (state) { state.maxReopen       = Math.max(1, Number($('maxreopen').value)  || DEFAULT_MAX_REOPEN); save(); } });
+  $('reload').addEventListener('change',       () => { if (state) { state.reloadMinutes   = Math.max(0, Number($('reload').value)     || 0);                  save(); } });
+  $('blockimgs').addEventListener('change',    () => { if (state) { state.blockImages     = $('blockimgs').checked;     save(); } });
+  $('blockfonts').addEventListener('change',   () => { if (state) { state.blockFonts      = $('blockfonts').checked;    save(); } });
+  $('blockanalytics').addEventListener('change',() => { if (state) { state.blockAnalytics = $('blockanalytics').checked; save(); } });
+  $('adaptconn').addEventListener('change',    () => { if (state) { state.adaptConn       = $('adaptconn').checked;     save(); } });
 
   // ─── Observadores ──────────────────────────────────────────────────────────
   new MutationObserver(changes => {
-    if (changes.some(change => !root.contains(change.target))) schedule();
+    if (changes.some(c => !root.contains(c.target))) schedule();
   }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'disabled'] });
 
-  // Tick principal: 250 ms base, pero respeta el backoff para no saturar más el servidor
   setInterval(() => {
+    applyConnAdapt(); // re-evaluar calidad de red periódicamente
     step();
-    if (state?.active && (state.phase === 'waiting' || backoffLevel > 0)) renderStatus();
+    if (state?.active) renderStatus();
   }, 250);
 
-  // Recarga periódica opcional — solo cuando no hay backoff activo
   setInterval(() => {
     if (!state?.active || !state.reloadMinutes || !onProductPage(state.productName) ||
-        document.visibilityState !== 'visible' || blocked() || backoffLevel > 1) return;
+        document.visibilityState !== 'visible' || blocked() || backoffLevel > 1 || connAdaptMultiplier === 0) return;
     if (Date.now() - state.lastReload < state.reloadMinutes * 60_000 ||
         modal(norm(state.productName), visibleHeadings())) return;
+    log('info', `Recarga periódica (cada ${state.reloadMinutes} min)`);
     state.lastReload = Date.now(); save(); location.reload();
   }, 30_000);
 
