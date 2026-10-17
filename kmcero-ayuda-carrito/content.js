@@ -4,7 +4,12 @@
   const SHOP = '/dashboard/buyer/shop';
   const DEFAULT_PRODUCT = 'Habana-Gas Licuado GLP (10kg / 22lb)';
   const productPageUrl = name => `${SHOP}?search=${encodeURIComponent(name)}`;
-  const KEY = 'kmcero-cart-helper-v1';
+  const KEY      = 'kmcero-cart-helper-v1';
+  const KEY_LIC  = 'kmcero-license-v1';   // clave de licencia en localStorage
+  // IMPORTANTE: cambia este valor por tu propia clave secreta antes de distribuir.
+  // Esta misma clave debes usar en keygen.html para generar licencias.
+  const LICENSE_SECRET = 'MI_CLAVE_SECRETA_PRIVADA_2024';
+
   const norm = value => String(value || '').toLocaleLowerCase('es').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim();
   const isShop = () => location.pathname.startsWith(SHOP);
   const onProductPage = name => isShop() && norm(new URLSearchParams(location.search).get('search')) === norm(name);
@@ -18,6 +23,79 @@
   const label = el => (el?.getAttribute('aria-label') || el?.innerText || el?.getAttribute('alt') || el?.textContent || '').trim();
 
   const DEFAULT_MAX_REOPEN = 5;
+
+  // ─── Sistema de licencias ──────────────────────────────────────────────────
+  // Formato de clave: KMCERO-XXXX-XXXX-XXXX-XXXX.PAYLOAD
+  // PAYLOAD = base64url(nombre|timestamp_expiracion)
+  // XXXX... = primeros 16 chars HMAC-SHA256(secret, payload) en hex mayúsculas
+
+  async function hmacSha256hex(secret, message) {
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      'raw', enc.encode(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false, ['sign']
+    );
+    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+    return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  function b64urlDecode(str) {
+    // base64url → base64 → string
+    str = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (str.length % 4) str += '=';
+    try { return atob(str); } catch { return null; }
+  }
+
+  // Retorna { valid, reason, username, expiresAt } 
+  async function validateLicense(fullKey) {
+    if (!fullKey || typeof fullKey !== 'string') return { valid: false, reason: 'Clave vacía' };
+
+    const dotIdx = fullKey.indexOf('.');
+    if (dotIdx === -1) return { valid: false, reason: 'Formato inválido' };
+
+    const keyPart     = fullKey.substring(0, dotIdx).trim().toUpperCase();
+    const payloadB64  = fullKey.substring(dotIdx + 1).trim();
+
+    // Verificar prefijo y estructura KMCERO-XXXX-XXXX-XXXX-XXXX
+    if (!keyPart.startsWith('KMCERO-')) return { valid: false, reason: 'Prefijo inválido' };
+    const sigPart = keyPart.replace('KMCERO-', '').replace(/-/g, '');
+    if (sigPart.length !== 16) return { valid: false, reason: 'Firma con longitud incorrecta' };
+
+    // Decodificar payload
+    const decoded = b64urlDecode(payloadB64);
+    if (!decoded) return { valid: false, reason: 'Payload corrupto' };
+
+    const parts = decoded.split('|');
+    if (parts.length !== 2) return { valid: false, reason: 'Payload mal formado' };
+
+    const [username, expStr] = parts;
+    const expiresAt = parseInt(expStr, 10);
+    if (isNaN(expiresAt)) return { valid: false, reason: 'Fecha de expiración inválida' };
+
+    // Verificar que no haya expirado
+    if (Date.now() > expiresAt) {
+      const daysAgo = Math.ceil((Date.now() - expiresAt) / 86_400_000);
+      return { valid: false, reason: `Licencia expirada hace ${daysAgo} día(s)`, username, expiresAt };
+    }
+
+    // Verificar firma HMAC
+    const expectedHmac = await hmacSha256hex(LICENSE_SECRET, payloadB64);
+    const expectedSig  = expectedHmac.substring(0, 16).toUpperCase();
+    if (sigPart !== expectedSig) return { valid: false, reason: 'Firma inválida — clave no auténtica' };
+
+    const daysLeft = Math.ceil((expiresAt - Date.now()) / 86_400_000);
+    return { valid: true, reason: 'OK', username, expiresAt, daysLeft };
+  }
+
+  // Estado de licencia cargado al inicio
+  let licenseState = { valid: false, reason: 'Sin licencia', username: '', daysLeft: 0 };
+
+  async function checkStoredLicense() {
+    const stored = localStorage.getItem(KEY_LIC);
+    if (!stored) { licenseState = { valid: false, reason: 'Sin licencia' }; return; }
+    licenseState = await validateLicense(stored);
+  }
 
   // ─── Logger ────────────────────────────────────────────────────────────────
   const LOG_STYLES = {
@@ -387,10 +465,12 @@
       #toggle { position: fixed; left: 18px; bottom: 18px; z-index: 2147483646; border: 0; border-radius: 999px; padding: 13px 18px; background: #096b59; color: white; font: 700 14px system-ui; box-shadow: 0 5px 20px #0004; cursor: pointer; }
       #panel { position: fixed; left: 18px; bottom: 72px; z-index: 2147483646; width: min(390px, calc(100vw - 36px)); background: white; color: #152621; border: 1px solid #d2e2dc; border-radius: 16px; box-shadow: 0 12px 38px #0004; font: 14px system-ui; overflow: hidden; display: none; }
       #panel.open { display: block; }
-      header { padding: 16px; background: #ecf7f3; }
-      h2 { margin: 0 0 6px; font-size: 18px; }
-      header p { margin: 0; color: #52635d; font-size: 12px; line-height: 1.45; }
-      main { padding: 15px 16px; }
+      main { padding: 12px 16px; }
+      #lic-bar { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:7px 10px; background:#ecf7f3; border-radius:8px; font-size:12px; color:#096b59; margin-bottom:10px; }
+      #lic-bar span { font-weight:700; }
+      #lic-bar small { color:#52635d; font-weight:400; }
+      #lic-bar button { border:0; background:none; color:#b45309; font-size:11px; cursor:pointer; padding:2px 6px; border-radius:4px; white-space:nowrap; }
+      #lic-bar button:hover { background:#fff3cd; }
       section.group { border: 1px solid #d2e2dc; border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
       section.group summary-title { display: block; font-weight: 700; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #52635d; margin-bottom: 8px; }
       strong.block { display: block; margin-bottom: 9px; }
@@ -408,13 +488,20 @@
     </style>
     <button id="toggle" type="button">🛒 Ayuda carrito</button>
     <section id="panel" aria-label="Ayuda para comprar">
-      <header>
-        <h2>Ayuda para el carrito</h2>
-        <p>Busca el producto por su nombre exacto y vigila su ficha en la tienda KMCERO.</p>
-      </header>
       <main>
-        <strong class="block">Producto</strong>
-        <input id="product" type="text" placeholder="Nombre exacto del producto">
+        <!-- Barra de licencia: se reemplaza según estado -->
+        <div id="lic-bar" style="display:none"></div>
+
+        <div id="lic-section">
+          <strong class="block">🔑 Licencia de uso</strong>
+          <input id="license-input" type="text" placeholder="KMCERO-XXXX-XXXX-XXXX-XXXX.xxxxx" autocomplete="off" spellcheck="false">
+          <div id="lic-status" style="font-size:12px;margin-top:6px;min-height:18px;"></div>
+          <button id="lic-save" class="action" type="button" style="margin-top:8px;font-size:12px;padding:7px 12px">Validar licencia</button>
+        </div>
+
+        <div id="main-section" style="display:none">
+          <strong class="block">Producto</strong>
+          <input id="product" type="text" placeholder="Nombre exacto del producto">
 
         <section class="group">
           <summary-title>⏱ Reintentos</summary-title>
@@ -511,6 +598,63 @@
   ensureState();
   renderStatus();
   log('info', 'Extensión iniciada', { version: '2.4.0' });
+
+  // ── Inicializar licencia ──────────────────────────────────────────────────
+  async function renderLicense() {
+    await checkStoredLicense();
+    const bar   = $('lic-bar');
+    const sec   = $('lic-section');
+    const main  = $('main-section');
+
+    if (licenseState.valid) {
+      const exp = new Date(licenseState.expiresAt).toLocaleDateString('es', { day:'2-digit', month:'short', year:'numeric' });
+      const days = licenseState.daysLeft;
+      const daysColor = days <= 5 ? 'color:#b45309' : 'color:#096b59';
+      // Barra compacta: ✅ Usuario · vence DD/MM/YYYY · X días  [Cambiar]
+      bar.style.display = 'flex';
+      bar.innerHTML = `<span>✅ ${licenseState.username}</span><small style="${daysColor}">${days}d · ${exp}</small><button id="lic-change">Cambiar</button>`;
+      sec.style.display  = 'none';
+      main.style.display = 'block';
+      // Listener del botón Cambiar (se regenera con innerHTML)
+      $('lic-change').addEventListener('click', () => {
+        localStorage.removeItem(KEY_LIC);
+        bar.style.display  = 'none';
+        sec.style.display  = 'block';
+        main.style.display = 'none';
+        $('lic-status').textContent = '';
+        $('license-input').value = '';
+        licenseState = { valid: false, reason: 'Sin licencia' };
+      });
+    } else {
+      bar.style.display  = 'none';
+      sec.style.display  = 'block';
+      main.style.display = 'none';
+      const ls = $('lic-status');
+      ls.style.color   = '#dc2626';
+      ls.textContent   = licenseState.reason === 'Sin licencia'
+        ? '⚠️ Ingresa tu clave de licencia para continuar.'
+        : `❌ ${licenseState.reason}`;
+    }
+  }
+
+  $('lic-save').addEventListener('click', async () => {
+    const val = $('license-input').value.trim();
+    if (!val) return;
+    const result = await validateLicense(val);
+    if (result.valid) {
+      localStorage.setItem(KEY_LIC, val);
+      await renderLicense();
+    } else {
+      const ls = $('lic-status');
+      ls.style.color = '#dc2626';
+      ls.textContent = `❌ ${result.reason}`;
+    }
+  });
+
+  // Validar también con Enter en el campo de licencia
+  $('license-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('lic-save').click(); });
+
+  renderLicense();
 
   // ─── Helpers DOM ──────────────────────────────────────────────────────────
   function visibleHeadings() {
@@ -733,7 +877,17 @@
   // ─── Eventos UI ────────────────────────────────────────────────────────────
   $('toggle').addEventListener('click', () => { $('panel').classList.toggle('open'); renderStatus(); });
 
-  $('start').addEventListener('click', () => {
+  $('start').addEventListener('click', async () => {
+    // Re-verificar licencia antes de activar
+    await checkStoredLicense();
+    if (!licenseState.valid) {
+      $('lic-status').style.color = '#dc2626';
+      $('lic-status').textContent = '❌ Licencia inválida o expirada. No se puede activar.';
+      $('main-section').style.display = 'none';
+      $('lic-section').style.display  = 'block';
+      $('lic-bar').style.display      = 'none';
+      return;
+    }
     const name           = $('product').value.trim() || DEFAULT_PRODUCT;
     const retrySeconds   = Math.max(1, Number($('retry').value)     || 10);
     const maxReopen      = Math.max(1, Number($('maxreopen').value)  || DEFAULT_MAX_REOPEN);

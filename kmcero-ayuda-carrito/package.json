@@ -1,0 +1,11 @@
+{
+  "name": "kmcero-ayuda-carrito",
+  "version": "2.4.0",
+  "description": "Extensión Chrome para añadir productos al carrito de KMCERO automáticamente.",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "devDependencies": {
+    "javascript-obfuscator": "^5.9.0"
+  }
+}
